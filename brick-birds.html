@@ -6200,8 +6200,6 @@ void main() {
     function applyQuality(name){
       const q=qualityModes[name]||qualityModes.balanced;game.v12.quality=name;game.v11.minDpr=Math.max(.42,q.dpr-.12);game.v11.maxDpr=q.max;game.v11.dpr=Math.min(q.max,Math.max(game.v11.minDpr,q.dpr));game.v11.targetMs=q.frame;
       game.renderer.setPixelRatio(game.v11.dpr);game.renderer.setSize(window.innerWidth,window.innerHeight,false);
-      const realShadows=name==='quality';game.renderer.shadowMap.enabled=realShadows;if(game.sun){game.sun.castShadow=realShadows;if(game.sun.shadow){game.sun.shadow.mapSize.set(1024,1024);game.sun.shadow.bias=-.00045;game.sun.shadow.normalBias=.035;}}
-      if(game.visualWorld)game.visualWorld.receiveShadow=realShadows;[game.player,...game.npcs.map(n=>n.root)].filter(Boolean).forEach(root=>root.traverse(o=>{if(o.isMesh)o.castShadow=realShadows;}));
       (game.clouds||[]).forEach((o,i)=>o.visible=i%q.cloudMod===0);(game.waterfalls||[]).forEach((o,i)=>o.visible=i%q.fallMod===0);(game.distantIslands||[]).forEach((o,i)=>o.visible=i%q.islandMod===0);
       quality.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.q===name));
       game.toast(`${name[0].toUpperCase()+name.slice(1)} visuals enabled`);
@@ -6394,5 +6392,1286 @@ void main() {
 })();
 
 </script>
+
+<script>
+(function(){
+  function install(){
+    const game=window.__brickBirdsGame;
+    if(!game||!game.__v12Patched||game.__v13Patched)return false;
+    game.__v13Patched=true;
+    console.info('Brick Birds v13 — smooth rival locomotion and real edge-fall physics');
+
+    game.v13={states:new Map(),lastRender:performance.now(),gravity:10.8,terminal:-12.5};
+
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const expDamp=(rate,dt)=>1-Math.exp(-rate*dt);
+    const angleDelta=(a,b)=>(b-a+Math.PI)%(Math.PI*2)-Math.PI;
+
+    function stateFor(npc){
+      let s=game.v13.states.get(npc);
+      if(!s){
+        const p=npc.root.position;
+        s={
+          falling:false,vy:0,vx:0,vz:0,speed:0,
+          heading:npc.root.rotation.y||0,lastPos:p.clone(),renderPos:p.clone(),lastSafe:p.clone(),
+          turnVelocity:0,airTime:0,recoveryCooldown:0
+        };
+        game.v13.states.set(npc,s);
+      }
+      return s;
+    }
+
+    function groundBelow(pos,up=.5,down=1.15){
+      return game.getWalkableGroundHeight(pos.x,pos.z,pos.y+up,pos.y-down);
+    }
+
+    function beginFall(npc,s,horizontalX,horizontalZ){
+      if(s.falling)return;
+      s.falling=true;s.airTime=0;s.vy=Math.min(s.vy,-.15);
+      const mag=Math.hypot(horizontalX,horizontalZ);
+      if(mag>.01){s.vx=horizontalX;s.vz=horizontalZ;}
+      else{
+        const h=s.heading||npc.root.rotation.y||0;
+        s.vx=Math.sin(h)*.8;s.vz=Math.cos(h)*.8;
+      }
+      if(npc.ai){npc.ai.yield=Math.max(npc.ai.yield||0,.3);npc.ai.path=[];npc.ai.pathIndex=0;}
+    }
+
+    function landNpc(npc,s,y){
+      npc.root.position.y=y;
+      s.falling=false;s.vy=0;s.airTime=0;
+      s.lastSafe.copy(npc.root.position);
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(npc.root.position);
+      if(npc.ai){npc.ai.yield=0;npc.ai.stuck=0;npc.ai.blocked=0;npc.ai.retarget=0;}
+    }
+
+    function recoverNpc(npc,s){
+      const base=(s.lastSafe&&Number.isFinite(s.lastSafe.y))?s.lastSafe:(game.getSpawnPosition?game.getSpawnPosition():new W(0,1,3));
+      npc.root.position.copy(base);
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(base);
+      s.renderPos.copy(base);s.lastPos.copy(base);s.falling=false;s.vy=0;s.vx=0;s.vz=0;s.airTime=0;s.recoveryCooldown=.8;
+      if(npc.ai){npc.ai.targetEgg=null;npc.ai.retarget=0;npc.ai.path=[];npc.ai.pathIndex=0;npc.ai.stuck=0;npc.ai.blocked=0;}
+    }
+
+    function desiredGoal(npc){
+      const project=game.v11?.projects?.find(p=>!p.complete&&p.id===npc.ai?.projectId);
+      if(project)return project.site;
+      if(npc.ai?.targetEgg&&!npc.ai.targetEgg.userData.collected)return npc.ai.targetEgg.position;
+      return npc.root.userData?.target||npc.root.position;
+    }
+
+    function updateNpcPhysics(npc,dt){
+      if(!npc?.root?.visible)return;
+      const s=stateFor(npc),pos=npc.root.position;
+      s.recoveryCooldown=Math.max(0,s.recoveryCooldown-dt);
+
+      const rawDx=(pos.x-s.lastPos.x)/Math.max(dt,.001),rawDz=(pos.z-s.lastPos.z)/Math.max(dt,.001);
+      const observedSpeed=Math.hypot(rawDx,rawDz);
+      const velBlend=expDamp(8,dt);
+      if(!s.falling){
+        s.vx+=(rawDx-s.vx)*velBlend;
+        s.vz+=(rawDz-s.vz)*velBlend;
+      }
+
+      let ground=groundBelow(pos,.48,1.3);
+      if(!s.falling){
+        if(ground!==null&&Math.abs(pos.y-ground)<.48){
+          pos.y+=(ground-pos.y)*expDamp(20,dt);
+          s.lastSafe.copy(pos);
+        }else if(ground===null||pos.y-ground>.5){
+          beginFall(npc,s,s.vx,s.vz);
+        }else if(pos.y<ground){
+          pos.y=ground;s.lastSafe.copy(pos);
+        }
+
+        // A rival may deliberately drop to a lower platform when its current goal is below the ledge.
+        if(!s.falling&&observedSpeed>.16&&s.recoveryCooldown<=0){
+          const goal=desiredGoal(npc),gx=goal.x-pos.x,gz=goal.z-pos.z,glen=Math.hypot(gx,gz);
+          if(glen>.5&&goal.y<pos.y-.45){
+            const dx=gx/glen,dz=gz/glen,probe=.5;
+            const ahead=new W(pos.x+dx*probe,pos.y,pos.z+dz*probe);
+            const aheadGround=groundBelow(ahead,.3,.95);
+            if(aheadGround===null){
+              pos.x+=dx*.08;pos.z+=dz*.08;
+              beginFall(npc,s,dx*Math.max(.9,observedSpeed),dz*Math.max(.9,observedSpeed));
+            }
+          }
+        }
+      }
+
+      if(s.falling){
+        s.airTime+=dt;
+        s.vy=Math.max(game.v13.terminal,s.vy-game.v13.gravity*dt);
+        const drag=Math.pow(.88,dt*60);
+        s.vx*=drag;s.vz*=drag;
+        const previousY=pos.y;
+        pos.x+=s.vx*dt;pos.z+=s.vz*dt;pos.y+=s.vy*dt;
+        const landing=game.getWalkableGroundHeight(pos.x,pos.z,previousY+.25,pos.y-.75);
+        if(landing!==null&&s.vy<=0&&pos.y<=landing+.04&&previousY>=landing-.18){
+          landNpc(npc,s,landing);
+        }else{
+          if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(pos);
+          if(npc.ai)npc.ai.yield=Math.max(npc.ai.yield||0,.25);
+        }
+        if(pos.y<-9||!Number.isFinite(pos.y))recoverNpc(npc,s);
+      }
+
+      s.speed+=(Math.hypot(s.vx,s.vz)-s.speed)*expDamp(s.falling?5:9,dt);
+      s.lastPos.copy(pos);
+    }
+
+    function smoothNpcVisual(npc,dt){
+      if(!npc?.root?.visible)return;
+      const s=stateFor(npc),pos=npc.root.position;
+      if(!s.falling){
+        const horizontal=Math.hypot(s.vx,s.vz);
+        if(horizontal>.08){
+          const desired=Math.atan2(s.vx,s.vz);
+          const delta=angleDelta(s.heading,desired);
+          s.heading+=delta*expDamp(10,dt);
+          s.turnVelocity+=(delta-s.turnVelocity)*expDamp(8,dt);
+        }else s.turnVelocity*=Math.pow(.15,dt);
+      }
+      npc.root.rotation.y=s.heading;
+
+      // Smooth the visible model independently from the collision root to remove AI-tick jitter.
+      s.renderPos.lerp(pos,expDamp(s.falling?14:9.5,dt));
+      if(npc.visual){
+        const wx=s.renderPos.x-pos.x,wz=s.renderPos.z-pos.z,c=Math.cos(-s.heading),sn=Math.sin(-s.heading);
+        npc.visual.position.x=wx*c-wz*sn;
+        npc.visual.position.z=wx*sn+wz*c;
+      }
+
+      if(npc.rig){
+        npc.rig.update(game.time,clamp(s.speed,0,2.5),s.falling,false);
+        if(npc.rig.bob){
+          const moving=clamp(s.speed/2.2,0,1);
+          npc.rig.bob.rotation.x=(s.falling?-.16:moving*.025);
+          npc.rig.bob.rotation.z+=clamp(-s.turnVelocity*.16,-.11,.11);
+          if(s.falling)npc.rig.bob.position.y+=Math.sin(s.airTime*10)*.018;
+        }
+      }
+    }
+
+    /* Allow the player to leave an unsupported edge instead of treating empty space as a wall. */
+    const oldValidate=game.validateMove.bind(game);
+    game.validateMove=function(from,to){
+      const result=oldValidate(from,to);
+      if(!result.allowed&&result.ground===null){
+        const candidate=to.clone();candidate.y=from.y;
+        if(!this.hasWorldWallBetween(from,candidate)&&!this.collidesWithCharacter(candidate))return{allowed:true,ground:null,falling:true};
+      }
+      return result;
+    };
+    const oldTryMove=game.tryMovePlayer.bind(game);
+    game.tryMovePlayer=function(dir,distance){
+      const before=this.player.position.clone();
+      oldTryMove(dir,distance);
+      if(before.distanceToSquared(this.player.position)>.000001&&this.onGround){
+        const ground=this.getWalkableGroundHeight(this.player.position.x,this.player.position.z,this.player.position.y+.25,this.player.position.y-.5);
+        if(ground===null){this.onGround=false;this.playerVelocityY=Math.min(this.playerVelocityY,-.05);}
+      }
+    };
+
+    const oldStart=game.startGame.bind(game),oldReset=game.resetGame.bind(game),oldSelect=game.selectBird.bind(game);
+    game.startGame=function(){oldStart();game.v13.states.clear();this.toast('Movement smoothed — birds can now fall from ledges');};
+    game.resetGame=function(){oldReset();game.v13.states.clear();};
+    game.selectBird=function(id,swap){oldSelect(id,swap);game.v13.states.clear();};
+
+    /* Run physics and final animation immediately before each actual scene render. */
+    const nativeRender=game.renderer.render.bind(game.renderer);
+    game.renderer.render=function(scene,camera){
+      const now=performance.now(),dt=clamp((now-game.v13.lastRender)/1000,.001,.06);game.v13.lastRender=now;
+      if(game.isPlaying){
+        for(const npc of game.npcs)updateNpcPhysics(npc,dt);
+      }
+      for(const npc of game.npcs)smoothNpcVisual(npc,dt);
+      return nativeRender(scene,camera);
+    };
+
+    // Contact shadows should disappear while a bird is airborne instead of floating below it.
+    const style=document.createElement('style');
+    style.textContent='.v13-note{position:fixed;left:18px;bottom:64px;z-index:27;color:#ffffff72;font:800 8px/1.2 system-ui;letter-spacing:.09em;pointer-events:none}';
+    document.head.appendChild(style);
+    const note=document.createElement('div');note.className='v13-note';note.textContent='SMOOTH LOCOMOTION · EDGE FALL PHYSICS';document.body.appendChild(note);
+  }
+  if(!install()){let tries=0;const timer=setInterval(()=>{tries++;if(install()||tries>220)clearInterval(timer);},100);}
+})();
+</script>
+
+
+<script>
+(function(){
+  function install(){
+    const game=window.__brickBirdsGame;
+    if(!game||!game.__v13Patched||game.__v14Patched)return false;
+    game.__v14Patched=true;
+    console.info('Brick Birds v14 — restored hop locomotion, stable NPC rendering, HUD toggle');
+
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const damp=(rate,dt)=>1-Math.exp(-rate*dt);
+    const angleDelta=(a,b)=>Math.atan2(Math.sin(b-a),Math.cos(b-a));
+
+    /* Bypass the v13 renderer wrapper. It updated physics every render pass,
+       which could run more than once per game frame and caused animation jumps. */
+    let rendererProto=Object.getPrototypeOf(game.renderer);
+    while(rendererProto&&!Object.prototype.hasOwnProperty.call(rendererProto,'render'))rendererProto=Object.getPrototypeOf(rendererProto);
+    if(!rendererProto||typeof rendererProto.render!=='function')return false;
+    const nativeRender=rendererProto.render;
+
+    game.v14={states:new Map(),lastNow:performance.now(),lastFrameKey:-1};
+
+    function stateFor(npc){
+      let s=game.v14.states.get(npc);
+      if(!s){
+        const p=npc.root.position.clone();
+        s={
+          previous:p.clone(),physics:p.clone(),render:p.clone(),lastSafe:p.clone(),
+          speed:0,heading:npc.root.rotation.y||0,turn:0,phase:Math.random()*Math.PI*2,
+          hop:0,falling:false,vy:0,vx:0,vz:0,airTime:0
+        };
+        game.v14.states.set(npc,s);
+      }
+      return s;
+    }
+
+    function supportAt(pos,up=.42,down=.9){
+      return game.getWalkableGroundHeight(pos.x,pos.z,pos.y+up,pos.y-down);
+    }
+
+    function startFall(npc,s,vx,vz){
+      if(s.falling)return;
+      s.falling=true;s.airTime=0;s.vy=Math.min(s.vy,-.12);
+      const m=Math.hypot(vx,vz);
+      if(m>.04){s.vx=vx;s.vz=vz;}
+      else{s.vx=Math.sin(s.heading)*.65;s.vz=Math.cos(s.heading)*.65;}
+      s.physics.copy(npc.root.position);
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(npc.root.position);
+      if(npc.ai){npc.ai.yield=Math.max(npc.ai.yield||0,.3);npc.ai.path=[];npc.ai.pathIndex=0;}
+    }
+
+    function land(npc,s,y){
+      s.physics.y=y;npc.root.position.copy(s.physics);s.falling=false;s.vy=0;s.airTime=0;
+      s.lastSafe.copy(npc.root.position);s.previous.copy(npc.root.position);s.render.copy(npc.root.position);
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(npc.root.position);
+      if(npc.ai){npc.ai.yield=0;npc.ai.stuck=0;npc.ai.blocked=0;npc.ai.retarget=0;}
+    }
+
+    function recover(npc,s){
+      const p=(s.lastSafe&&Number.isFinite(s.lastSafe.y))?s.lastSafe:(game.getSpawnPosition?game.getSpawnPosition():new W(0,1,3));
+      npc.root.position.copy(p);s.physics.copy(p);s.previous.copy(p);s.render.copy(p);
+      s.falling=false;s.vx=s.vy=s.vz=0;s.airTime=0;s.speed=0;s.hop=0;
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(p);
+      if(npc.ai){npc.ai.targetEgg=null;npc.ai.retarget=0;npc.ai.path=[];npc.ai.pathIndex=0;npc.ai.stuck=0;npc.ai.blocked=0;}
+    }
+
+    function updateNpc(npc,dt){
+      if(!npc?.root?.visible)return;
+      const s=stateFor(npc),root=npc.root;
+
+      if(!s.falling){
+        const dx=root.position.x-s.previous.x,dz=root.position.z-s.previous.z;
+        const rawSpeed=clamp(Math.hypot(dx,dz)/Math.max(dt,.001),0,5);
+        s.speed+=(rawSpeed-s.speed)*damp(rawSpeed>s.speed?11:7,dt);
+        if(rawSpeed>.05){
+          const desired=Math.atan2(dx,dz),delta=angleDelta(s.heading,desired);
+          s.heading+=delta*damp(9,dt);s.turn+=(delta-s.turn)*damp(7,dt);
+        }else{s.turn*=Math.pow(.08,dt);}
+        root.rotation.y=s.heading;
+
+        const ground=supportAt(root.position,.48,1.05);
+        if(ground===null){
+          startFall(npc,s,dx/Math.max(dt,.001),dz/Math.max(dt,.001));
+        }else{
+          if(root.position.y<ground)root.position.y=ground;
+          if(Math.abs(root.position.y-ground)<.5)s.lastSafe.copy(root.position);
+          s.physics.copy(root.position);
+        }
+      }
+
+      if(s.falling){
+        /* Ignore AI target interpolation while airborne and integrate one stable body. */
+        root.position.copy(s.physics);
+        s.airTime+=dt;s.vy=Math.max(-12.5,s.vy-10.8*dt);
+        const drag=Math.pow(.93,dt*60);s.vx*=drag;s.vz*=drag;
+        const oldY=s.physics.y;
+        s.physics.x+=s.vx*dt;s.physics.z+=s.vz*dt;s.physics.y+=s.vy*dt;
+        root.position.copy(s.physics);
+        if(root.userData?.target?.copy)root.userData.target.copy(root.position);
+        const ground=game.getWalkableGroundHeight(s.physics.x,s.physics.z,oldY+.2,s.physics.y-.8);
+        if(ground!==null&&s.vy<=0&&s.physics.y<=ground+.05&&oldY>=ground-.22)land(npc,s,ground);
+        else if(s.physics.y<-9||!Number.isFinite(s.physics.y))recover(npc,s);
+        s.speed+=(Math.hypot(s.vx,s.vz)-s.speed)*damp(5,dt);
+      }
+
+      /* Smooth only the displayed child, never the collision/root object. */
+      const displacement=root.position.distanceTo(s.render);
+      if(displacement>3.5)s.render.copy(root.position);
+      else s.render.lerp(root.position,damp(s.falling?15:12,dt));
+
+      const moving=!s.falling&&s.speed>.12;
+      if(moving)s.phase+=dt*(5.2+clamp(s.speed,0,3)*1.8);
+      const wave=Math.abs(Math.sin(s.phase));
+      const hopTarget=moving?.115*Math.pow(wave,1.25):0;
+      s.hop+=(hopTarget-s.hop)*damp(moving?18:12,dt);
+
+      if(npc.rig){
+        npc.rig.update(game.time,clamp(s.speed,0,2.4),s.falling,false);
+        const bob=npc.rig.bob;
+        if(bob){
+          const wx=s.render.x-root.position.x,wz=s.render.z-root.position.z;
+          const c=Math.cos(-s.heading),sn=Math.sin(-s.heading);
+          bob.position.x=wx*c-wz*sn;
+          bob.position.z=wx*sn+wz*c;
+          bob.position.y+=s.hop+(s.falling?Math.sin(s.airTime*9)*.012:0);
+          bob.rotation.x=s.falling?-.17:(moving?Math.sin(s.phase)*.025:0);
+          bob.rotation.z=clamp(-s.turn*.08,-.075,.075);
+        }
+      }
+
+      s.previous.copy(root.position);
+    }
+
+    /* Run exactly once immediately before the actual WebGL draw. */
+    game.renderer.render=function(scene,camera){
+      const now=performance.now();
+      const frameKey=game.v11?.frame??game.v9Perf?.frame??game.__frameIndex??Math.floor(now/8);
+      if(frameKey!==game.v14.lastFrameKey){
+        const dt=clamp((now-game.v14.lastNow)/1000,.001,.055);
+        game.v14.lastNow=now;game.v14.lastFrameKey=frameKey;
+        for(const npc of game.npcs)updateNpc(npc,dt);
+        if(game.v12?.contactShadows){
+          const actors=[game.player,...game.npcs.map(n=>n.root)].filter(Boolean);
+          actors.forEach((actor,index)=>{
+            const shadow=game.v12.contactShadows[index];if(!shadow)return;
+            if(actor===game.player)shadow.visible=actor.visible&&game.onGround;
+            else{const npc=game.npcs.find(n=>n.root===actor),s=npc?stateFor(npc):null;shadow.visible=actor.visible&&!(s&&s.falling);}
+          });
+        }
+      }
+      return nativeRender.call(this,scene,camera);
+    };
+
+    const resetStates=()=>{game.v14.states.clear();game.v14.lastNow=performance.now();game.v14.lastFrameKey=-1;};
+    const oldStart=game.startGame.bind(game),oldReset=game.resetGame.bind(game),oldSelect=game.selectBird.bind(game);
+    game.startGame=function(){oldStart();resetStates();this.toast('Bird hopping restored · press H to hide the HUD');};
+    game.resetGame=function(){oldReset();resetStates();};
+    game.selectBird=function(id,swap){oldSelect(id,swap);resetStates();};
+
+    /* HUD / overlay visibility toggle. The tiny HUD button remains available. */
+    const style=document.createElement('style');
+    style.textContent=`
+      #overlay-toggle{position:fixed;z-index:80;right:18px;bottom:max(18px,env(safe-area-inset-bottom));height:38px;min-width:54px;padding:0 13px;border-radius:13px;border:1px solid #ffffff2b;background:#07101dd9;color:#fff;font:900 10px/1 system-ui;letter-spacing:.1em;backdrop-filter:blur(14px);cursor:pointer;box-shadow:0 8px 28px #0005}
+      #overlay-toggle:hover{background:#ffffff18}
+      body.hide-game-overlays.is-playing .topbar,
+      body.hide-game-overlays.is-playing #hud,
+      body.hide-game-overlays.is-playing .race-panel,
+      body.hide-game-overlays.is-playing .build-panel,
+      body.hide-game-overlays.is-playing .quality-control,
+      body.hide-game-overlays.is-playing .perf-badge,
+      body.hide-game-overlays.is-playing .v13-note,
+      body.hide-game-overlays.is-playing .toast,
+      body.hide-game-overlays.is-playing .swap-drawer{opacity:0!important;pointer-events:none!important;visibility:hidden!important}
+      body.hide-game-overlays.is-playing .mobile-controls{opacity:.34}
+      @media(max-width:850px){#overlay-toggle{right:10px;bottom:104px;height:34px;min-width:48px}}
+    `;
+    document.head.appendChild(style);
+    document.querySelectorAll('.v13-note').forEach(el=>el.remove());
+    let button=document.getElementById('overlay-toggle');if(!button){button=document.createElement('button');button.id='overlay-toggle';button.type='button';button.textContent='HIDE HUD';button.title='Hide/show game overlays (H)';document.body.appendChild(button);}
+    function toggleOverlays(force){
+      const hide=typeof force==='boolean'?force:!document.body.classList.contains('hide-game-overlays');
+      document.body.classList.toggle('hide-game-overlays',hide);button.textContent=hide?'SHOW HUD':'HIDE HUD';button.setAttribute('aria-pressed',String(hide));
+    }
+    /* v16 owns the HUD button and H shortcut. */
+  }
+  if(!install()){let tries=0;const timer=setInterval(()=>{tries++;if(install()||tries>240)clearInterval(timer);},100);}
+})();
+</script>
+
+<style id="hud-toggle-failsafe-style">
+  #overlay-toggle{
+    position:fixed!important;z-index:2147483647!important;top:18px!important;right:18px!important;
+    display:flex!important;align-items:center!important;justify-content:center!important;
+    min-width:104px!important;height:42px!important;padding:0 16px!important;
+    border:1px solid rgba(255,232,142,.78)!important;border-radius:14px!important;
+    background:linear-gradient(180deg,rgba(27,35,48,.96),rgba(7,13,23,.96))!important;
+    color:#fff7cf!important;font:900 11px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;
+    letter-spacing:.11em!important;cursor:pointer!important;visibility:visible!important;opacity:1!important;
+    pointer-events:auto!important;box-shadow:0 10px 32px rgba(0,0,0,.48),inset 0 1px 0 rgba(255,255,255,.13)!important;
+    -webkit-backdrop-filter:blur(14px)!important;backdrop-filter:blur(14px)!important;
+  }
+  #overlay-toggle::before{content:"◉";margin-right:8px;color:#ffe38b;font-size:12px}
+  #overlay-toggle[data-hidden="true"]::before{content:"◎"}
+  #overlay-toggle:hover{transform:translateY(-1px)!important;background:linear-gradient(180deg,rgba(52,61,75,.98),rgba(13,21,33,.98))!important}
+  body.hud-hidden .topbar,
+  body.hud-hidden #hud,
+  body.hud-hidden .race-panel,
+  body.hud-hidden .build-panel,
+  body.hud-hidden .quality-control,
+  body.hud-hidden .perf-badge,
+  body.hud-hidden .v13-note,
+  body.hud-hidden .toast,
+  body.hud-hidden .swap-drawer,
+  body.hud-hidden .region-card,
+  body.hud-hidden .project-panel,
+  body.hud-hidden .cooperation-panel{
+    opacity:0!important;visibility:hidden!important;pointer-events:none!important;
+  }
+  body.hud-hidden .mobile-controls{opacity:.22!important}
+  @media(max-width:850px){#overlay-toggle{top:10px!important;right:10px!important;height:38px!important;min-width:94px!important;padding:0 12px!important}}
+</style>
+<script>
+(function(){
+  function setupHudToggle(){
+    var button=document.getElementById('overlay-toggle');
+    if(!button){
+      button=document.createElement('button');
+      button.id='overlay-toggle';
+      button.type='button';
+      button.textContent='HIDE HUD';
+      document.body.appendChild(button);
+    }
+    if(button.dataset.failsafeBound==='true') return;
+    button.dataset.failsafeBound='true';
+    var hidden=false;
+    function sync(){
+      hidden=document.body.classList.contains('hud-hidden')||document.body.classList.contains('hide-game-overlays');
+      document.body.classList.toggle('hud-hidden',hidden);
+      document.body.classList.toggle('hide-game-overlays',hidden);
+      button.textContent=hidden?'SHOW HUD':'HIDE HUD';
+      button.dataset.hidden=String(hidden);
+      button.setAttribute('aria-pressed',String(hidden));
+      button.title=(hidden?'Show':'Hide')+' game overlays (H)';
+    }
+    function toggle(){
+      hidden=!(document.body.classList.contains('hud-hidden')||document.body.classList.contains('hide-game-overlays'));
+      document.body.classList.toggle('hud-hidden',hidden);
+      document.body.classList.toggle('hide-game-overlays',hidden);
+      sync();
+    }
+    /* v16 owns the HUD button and H shortcut. */
+    sync();
+    console.info('Brick Birds HUD toggle fail-safe active — click the upper-right button or press H');
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',setupHudToggle,{once:true});
+  else setupHudToggle();
+})();
+</script>
+
+
+<style id="v16-camera-hud-style">
+  body.hud-hidden #welcome-panel,
+  body.hide-game-overlays #welcome-panel,
+  body.hud-hidden .welcome-wrap,
+  body.hide-game-overlays .welcome-wrap {
+    opacity:0!important;
+    visibility:hidden!important;
+    pointer-events:none!important;
+    transform:translateY(12px) scale(.985)!important;
+  }
+  #welcome-panel{transition:opacity .24s ease,visibility .24s ease,transform .24s ease!important}
+</style>
+<script>
+(function(){
+  function installV16(){
+    const game=window.__brickBirdsGame;
+    if(!game||game.__v16Patched)return !!game;
+    game.__v16Patched=true;
+    console.info('Brick Birds v16 — automatic follow camera + title-screen HUD hiding');
+
+    const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
+    const damp=(rate,dt)=>1-Math.exp(-rate*Math.max(.001,dt));
+    const now=()=>performance.now();
+
+    /* Replace the existing toggle node so all legacy click listeners are removed. */
+    let oldButton=document.getElementById('overlay-toggle');
+    let button=oldButton?oldButton.cloneNode(true):document.createElement('button');
+    if(oldButton)oldButton.replaceWith(button);else document.body.appendChild(button);
+    button.id='overlay-toggle';
+    button.type='button';
+    button.dataset.v16Bound='true';
+
+    function hudIsHidden(){
+      return document.body.classList.contains('hud-hidden')||document.body.classList.contains('hide-game-overlays');
+    }
+    function syncHudButton(){
+      const hidden=hudIsHidden();
+      document.body.classList.toggle('hud-hidden',hidden);
+      document.body.classList.toggle('hide-game-overlays',hidden);
+      button.textContent=hidden?'SHOW HUD':'HIDE HUD';
+      button.dataset.hidden=String(hidden);
+      button.setAttribute('aria-pressed',String(hidden));
+      button.title=(hidden?'Show':'Hide')+' all overlays, including the title screen (H)';
+    }
+    function toggleHud(force){
+      const hidden=typeof force==='boolean'?force:!hudIsHidden();
+      document.body.classList.toggle('hud-hidden',hidden);
+      document.body.classList.toggle('hide-game-overlays',hidden);
+      syncHudButton();
+    }
+    button.addEventListener('click',function(event){event.preventDefault();event.stopPropagation();toggleHud();});
+    window.addEventListener('keydown',function(event){
+      if(event.code==='KeyH'&&!event.repeat&&!(event.target&&/INPUT|TEXTAREA|SELECT/.test(event.target.tagName))){
+        event.preventDefault();event.stopImmediatePropagation();toggleHud();
+      }
+    },true);
+    syncHudButton();
+
+    const oldUpdateCamera=game.updateCamera.bind(game);
+    const follow={
+      lastPlayer:null,
+      velocity:null,
+      forward:null,
+      previousTarget:null,
+      manual:false,
+      manualUntil:0,
+      forceRecenter:true,
+      distance:9.8,
+      height:5.35,
+      lookAhead:.8,
+      lastTime:now()
+    };
+    game.v16Camera=follow;
+
+    function makeVec(){return game.player?game.player.position.clone().set(0,0,0):game.camera.position.clone().set(0,0,0);}
+    follow.velocity=makeVec();
+    follow.forward=makeVec().set(0,0,-1);
+    follow.previousTarget=game.controls.target.clone();
+
+    function resetFollow(hard){
+      if(!game.player)return;
+      const playerWorld=game.player.position.clone().add(game.world.position);
+      follow.lastPlayer=playerWorld.clone();
+      follow.velocity.set(0,0,0);
+      follow.forward.set(Math.sin(game.heading||0),0,Math.cos(game.heading||0)).normalize();
+      follow.previousTarget.copy(game.controls.target);
+      follow.manual=false;
+      follow.manualUntil=0;
+      follow.forceRecenter=true;
+      follow.lastTime=now();
+      if(hard){
+        const target=playerWorld.clone().add(new W(0,.82,0));
+        const desired=target.clone().addScaledVector(follow.forward,-follow.distance).add(new W(0,follow.height,0));
+        game.controls.target.copy(target);
+        game.camera.position.copy(desired);
+        game.controls.update();
+      }
+    }
+
+    if(game.controls&&game.controls.addEventListener){
+      game.controls.addEventListener('start',()=>{follow.manual=true;follow.forceRecenter=false;});
+      game.controls.addEventListener('end',()=>{follow.manual=false;follow.manualUntil=now()+1100;});
+    }
+
+    window.addEventListener('keydown',event=>{
+      if(event.code==='KeyC'&&!event.repeat&&!(event.target&&/INPUT|TEXTAREA|SELECT/.test(event.target.tagName))){
+        follow.manual=false;follow.manualUntil=0;follow.forceRecenter=true;
+        if(game.isPlaying&&game.toast)game.toast('Camera recentered');
+      }
+    });
+
+    game.updateCamera=function(dt){
+      dt=clamp(dt||.016,.001,.055);
+      this.worldShift+=(0-this.worldShift)*damp(2.4,dt);
+      this.world.position.x=this.worldShift;
+
+      if(!this.isPlaying||!this.player){
+        oldUpdateCamera(dt);
+        follow.previousTarget.copy(this.controls.target);
+        return;
+      }
+
+      const playerWorld=this.player.position.clone().add(this.world.position);
+      if(!follow.lastPlayer)follow.lastPlayer=playerWorld.clone();
+      const frameMove=playerWorld.clone().sub(follow.lastPlayer);
+      const measured=frameMove.clone().multiplyScalar(1/Math.max(dt,.001));
+      measured.y=0;
+      follow.velocity.lerp(measured,damp(8.5,dt));
+      const speed=follow.velocity.length();
+
+      if(speed>.12){
+        const moveForward=follow.velocity.clone().setY(0).normalize();
+        follow.forward.lerp(moveForward,damp(speed>1?7.5:4.5,dt)).normalize();
+      }else{
+        const headingForward=playerWorld.clone().set(Math.sin(this.heading||0),0,Math.cos(this.heading||0));
+        follow.forward.lerp(headingForward,damp(2.2,dt)).normalize();
+      }
+
+      const lookDistance=clamp(.55+speed*.32,.55,2.15);
+      const desiredTarget=playerWorld.clone()
+        .add(new W(0,.82,0))
+        .addScaledVector(follow.forward,lookDistance);
+
+      const oldTarget=this.controls.target.clone();
+      this.controls.target.lerp(desiredTarget,damp(8.2,dt));
+      const targetShift=this.controls.target.clone().sub(oldTarget);
+
+      const manualHold=follow.manual||now()<follow.manualUntil;
+      if(manualHold&&!follow.forceRecenter){
+        /* Keep the manually selected orbit, but translate it with the player. */
+        this.camera.position.add(targetShift);
+      }else{
+        const distance=clamp(follow.distance+speed*.22,9.2,11.8);
+        const height=follow.height+clamp(speed*.07,0,.55);
+        const right=new W(follow.forward.z,0,-follow.forward.x);
+        let desiredCamera=this.controls.target.clone()
+          .addScaledVector(follow.forward,-distance)
+          .addScaledVector(right,.42)
+          .add(new W(0,height,0));
+
+        /* Pull the camera forward if terrain is between it and the bird. */
+        if(this.worldModel&&this.collisionRay){
+          this.world.updateMatrixWorld(true);
+          const rayOrigin=this.controls.target.clone().add(new W(0,.3,0));
+          const rayVector=desiredCamera.clone().sub(rayOrigin);
+          const rayDistance=rayVector.length();
+          if(rayDistance>.01){
+            rayVector.normalize();
+            this.collisionRay.set(rayOrigin,rayVector);
+            this.collisionRay.near=.2;
+            this.collisionRay.far=rayDistance;
+            const hits=this.collisionRay.intersectObject(this.worldModel,false);
+            const hit=hits.find(item=>item.distance>.45&&item.distance<rayDistance);
+            if(hit){
+              const safeDistance=Math.max(2.4,hit.distance-.55);
+              desiredCamera=rayOrigin.clone().addScaledVector(rayVector,safeDistance);
+              desiredCamera.y=Math.max(desiredCamera.y,this.controls.target.y+2.15);
+            }
+          }
+        }
+
+        const distanceToDesired=this.camera.position.distanceTo(desiredCamera);
+        const response=distanceToDesired>12?1:damp(follow.forceRecenter?7.5:4.4,dt);
+        this.camera.position.lerp(desiredCamera,response);
+        follow.forceRecenter=false;
+      }
+
+      if(this.cameraShake>.001&&this.motion>.5){
+        const shake=this.cameraShake;
+        this.camera.position.x+=(Math.random()-.5)*shake;
+        this.camera.position.y+=(Math.random()-.5)*shake*.45;
+        this.cameraShake*=Math.pow(.045,dt);
+      }
+
+      this.controls.update();
+      follow.lastPlayer.copy(playerWorld);
+      follow.previousTarget.copy(this.controls.target);
+    };
+
+    const oldStart=game.startGame.bind(game);
+    const oldReset=game.resetGame.bind(game);
+    const oldSelect=game.selectBird.bind(game);
+    game.startGame=function(){oldStart();requestAnimationFrame(()=>resetFollow(true));};
+    game.resetGame=function(){oldReset();requestAnimationFrame(()=>resetFollow(true));};
+    game.selectBird=function(id,swap){oldSelect(id,swap);requestAnimationFrame(()=>resetFollow(false));};
+
+    /* Start with the current title/HUD state synchronized. */
+    syncHudButton();
+  }
+  if(!installV16()){
+    let attempts=0;
+    const timer=setInterval(()=>{attempts++;if(installV16()||attempts>260)clearInterval(timer);},100);
+  }
+})();
+</script>
+
+
+
+<script>
+(function(){
+  function installV17(){
+    const game=window.__brickBirdsGame;
+    if(!game||!game.__v16Patched||game.__v17Patched)return !!game;
+    game.__v17Patched=true;
+    console.info('Brick Birds v17 — direction-locked rival facing, stable hop locomotion');
+
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const damp=(rate,dt)=>1-Math.exp(-rate*Math.max(.001,dt));
+    const angleDelta=(a,b)=>Math.atan2(Math.sin(b-a),Math.cos(b-a));
+    const FORWARD_OFFSET=0;
+
+    /* v14 installed a renderer wrapper that still mixed several generations of
+       locomotion logic. Replace it with one authoritative visual update that runs
+       exactly once per rendered frame. The AI/collision root remains untouched;
+       only the bird's display group is smoothed. */
+    let proto=Object.getPrototypeOf(game.renderer);
+    while(proto&&!Object.prototype.hasOwnProperty.call(proto,'render'))proto=Object.getPrototypeOf(proto);
+    if(!proto||typeof proto.render!=='function')return false;
+    const nativeRender=proto.render;
+
+    game.v17={
+      states:new Map(),
+      lastNow:performance.now(),
+      lastUpdate:0,
+      gravity:10.8,
+      terminal:-13
+    };
+
+    function stateFor(npc){
+      let s=game.v17.states.get(npc);
+      if(!s){
+        const p=npc.root.position.clone();
+        s={
+          lastLogical:p.clone(),display:p.clone(),lastSafe:p.clone(),
+          heading:Number.isFinite(npc.root.rotation.y)?npc.root.rotation.y:0,
+          desiredHeading:Number.isFinite(npc.root.rotation.y)?npc.root.rotation.y:0,
+          speed:0,phase:Math.random()*Math.PI*2,hop:0,turnLean:0,
+          falling:false,vy:0,vx:0,vz:0,airTime:0
+        };
+        game.v17.states.set(npc,s);
+      }
+      return s;
+    }
+
+    function supportAt(pos,up=.52,down=1.15){
+      return game.getWalkableGroundHeight(pos.x,pos.z,pos.y+up,pos.y-down);
+    }
+
+    function resetBob(npc){
+      const bob=npc.rig&&npc.rig.bob;
+      if(!bob)return;
+      bob.position.x=0;bob.position.y=0;bob.position.z=0;
+      bob.rotation.x=0;bob.rotation.y=0;bob.rotation.z=0;
+    }
+
+    function beginFall(npc,s,vx,vz){
+      if(s.falling)return;
+      s.falling=true;s.airTime=0;s.vy=Math.min(s.vy,-.08);
+      const mag=Math.hypot(vx,vz);
+      if(mag>.03){
+        const scale=Math.min(1.15,1/Math.max(mag,.001));
+        s.vx=vx*scale;s.vz=vz*scale;
+      }else{
+        s.vx=Math.sin(s.heading)*.72;
+        s.vz=Math.cos(s.heading)*.72;
+      }
+      if(npc.ai){
+        npc.ai.yield=Math.max(npc.ai.yield||0,.35);
+        npc.ai.path=[];npc.ai.pathIndex=0;
+      }
+    }
+
+    function land(npc,s,y){
+      npc.root.position.y=y;
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(npc.root.position);
+      s.lastLogical.copy(npc.root.position);
+      s.display.copy(npc.root.position);
+      s.lastSafe.copy(npc.root.position);
+      s.falling=false;s.vx=s.vy=s.vz=0;s.airTime=0;s.hop=0;
+      if(npc.ai){npc.ai.yield=0;npc.ai.stuck=0;npc.ai.blocked=0;npc.ai.retarget=0;}
+    }
+
+    function recover(npc,s){
+      const p=(s.lastSafe&&Number.isFinite(s.lastSafe.y))?s.lastSafe:(game.getSpawnPosition?game.getSpawnPosition():new W(0,1,3));
+      npc.root.position.copy(p);
+      if(npc.root.userData?.target?.copy)npc.root.userData.target.copy(p);
+      s.lastLogical.copy(p);s.display.copy(p);s.lastSafe.copy(p);
+      s.falling=false;s.vx=s.vy=s.vz=0;s.airTime=0;s.speed=0;s.hop=0;
+      if(npc.ai){npc.ai.targetEgg=null;npc.ai.retarget=0;npc.ai.path=[];npc.ai.pathIndex=0;npc.ai.stuck=0;npc.ai.blocked=0;}
+    }
+
+    function updateOne(npc,dt){
+      if(!npc?.root?.visible)return;
+      const root=npc.root,s=stateFor(npc);
+
+      /* The logical root is moved by the AI tick. Derive facing from that actual
+         accepted displacement, never from the egg target or an unaccepted route. */
+      let dx=root.position.x-s.lastLogical.x;
+      let dz=root.position.z-s.lastLogical.z;
+      let horizontal=Math.hypot(dx,dz);
+      let measuredSpeed=clamp(horizontal/Math.max(dt,.001),0,4.5);
+
+      if(!game.isPlaying){
+        s.display.copy(root.position);s.lastLogical.copy(root.position);s.speed=0;s.hop=0;
+        resetBob(npc);
+        npc.rig?.update(game.time,0,false,true);
+        return;
+      }
+
+      if(!s.falling){
+        if(horizontal>.0015){
+          s.desiredHeading=Math.atan2(dx,dz)+FORWARD_OFFSET;
+          const delta=angleDelta(s.heading,s.desiredHeading);
+          s.heading+=delta*damp(13,dt);
+          s.turnLean+=(clamp(delta,-.8,.8)-s.turnLean)*damp(10,dt);
+        }else{
+          measuredSpeed=0;
+          s.turnLean*=Math.pow(.035,dt);
+        }
+        s.speed+=(measuredSpeed-s.speed)*damp(measuredSpeed>s.speed?14:9,dt);
+
+        const ground=supportAt(root.position,.5,1.08);
+        if(ground===null){
+          beginFall(npc,s,dx/Math.max(dt,.001),dz/Math.max(dt,.001));
+        }else{
+          if(root.position.y<ground)root.position.y=ground;
+          if(Math.abs(root.position.y-ground)<.45)s.lastSafe.copy(root.position);
+        }
+      }
+
+      if(s.falling){
+        s.airTime+=dt;
+        s.vy=Math.max(game.v17.terminal,s.vy-game.v17.gravity*dt);
+        const drag=Math.pow(.965,dt*60);
+        s.vx*=drag;s.vz*=drag;
+        const oldY=root.position.y;
+        root.position.x+=s.vx*dt;
+        root.position.z+=s.vz*dt;
+        root.position.y+=s.vy*dt;
+        if(root.userData?.target?.copy)root.userData.target.copy(root.position);
+        const moveMag=Math.hypot(s.vx,s.vz);
+        if(moveMag>.025){
+          s.desiredHeading=Math.atan2(s.vx,s.vz)+FORWARD_OFFSET;
+          s.heading+=angleDelta(s.heading,s.desiredHeading)*damp(8,dt);
+        }
+        const ground=game.getWalkableGroundHeight(root.position.x,root.position.z,oldY+.2,root.position.y-.95);
+        if(ground!==null&&s.vy<=0&&root.position.y<=ground+.06&&oldY>=ground-.25)land(npc,s,ground);
+        else if(root.position.y<-9||!Number.isFinite(root.position.y))recover(npc,s);
+        s.speed+=(moveMag-s.speed)*damp(6,dt);
+      }
+
+      root.rotation.y=s.heading;
+
+      /* Smooth the rendered bird toward its collision body. This removes the AI
+         tick stepping without letting the model face a stale target. */
+      const error=s.display.distanceTo(root.position);
+      if(error>2.5)s.display.copy(root.position);
+      else s.display.lerp(root.position,damp(s.falling?16:11.5,dt));
+
+      const moving=!s.falling&&s.speed>.1&&horizontal>.0005;
+      if(moving)s.phase+=dt*(7.0+clamp(s.speed,0,3.2)*1.65);
+      const stride=Math.max(0,Math.sin(s.phase));
+      const hopTarget=moving?(0.12+clamp(s.speed,0,3)*.018)*Math.pow(stride,1.35):0;
+      s.hop+=(hopTarget-s.hop)*damp(moving?22:15,dt);
+
+      if(npc.rig){
+        /* Rig handles wing/foot pieces. We then set the body transform absolutely,
+           preventing offsets from accumulating frame over frame. */
+        npc.rig.update(game.time,clamp(s.speed,0,2.5),s.falling,false);
+        const bob=npc.rig.bob;
+        if(bob){
+          const wx=s.display.x-root.position.x;
+          const wz=s.display.z-root.position.z;
+          const c=Math.cos(-s.heading),sn=Math.sin(-s.heading);
+          bob.position.x=wx*c-wz*sn;
+          bob.position.z=wx*sn+wz*c;
+          bob.position.y=s.falling?Math.sin(s.airTime*10)*.012:s.hop;
+          bob.rotation.x=s.falling?-.18:(moving?-.025-clamp(s.speed,0,3)*.012:0);
+          bob.rotation.y=0;
+          bob.rotation.z=clamp(-s.turnLean*.11,-.095,.095);
+        }
+      }
+
+      s.lastLogical.copy(root.position);
+    }
+
+    game.renderer.render=function(scene,camera){
+      const now=performance.now();
+      /* Effect composers may invoke render more than once. Update animation only
+         once per actual display frame. */
+      if(now-game.v17.lastUpdate>3){
+        const dt=clamp((now-game.v17.lastNow)/1000,.001,.06);
+        game.v17.lastNow=now;game.v17.lastUpdate=now;
+        for(const npc of game.npcs)updateOne(npc,dt);
+        if(game.v12?.contactShadows){
+          const actors=[game.player,...game.npcs.map(n=>n.root)].filter(Boolean);
+          actors.forEach((actor,index)=>{
+            const shadow=game.v12.contactShadows[index];if(!shadow)return;
+            if(actor===game.player)shadow.visible=actor.visible&&game.onGround;
+            else{
+              const npc=game.npcs.find(n=>n.root===actor);
+              const state=npc?stateFor(npc):null;
+              shadow.visible=actor.visible&&!(state&&state.falling);
+            }
+          });
+        }
+      }
+      return nativeRender.call(this,scene,camera);
+    };
+
+    function resetStates(){
+      game.v17.states.clear();
+      game.v17.lastNow=performance.now();
+      game.v17.lastUpdate=0;
+      for(const npc of game.npcs)resetBob(npc);
+    }
+
+    const previousStart=game.startGame.bind(game);
+    const previousReset=game.resetGame.bind(game);
+    const previousSelect=game.selectBird.bind(game);
+    game.startGame=function(){previousStart();resetStates();this.toast('Rivals now face and hop in their actual travel direction');};
+    game.resetGame=function(){previousReset();resetStates();};
+    game.selectBird=function(id,swap){previousSelect(id,swap);resetStates();};
+
+    const badge=document.createElement('div');
+    badge.textContent='DIRECTIONAL NPC LOCOMOTION';
+    badge.style.cssText='position:fixed;left:14px;bottom:14px;z-index:16;padding:6px 9px;border-radius:10px;background:#07101d99;border:1px solid #ffffff17;color:#ffffff78;font:800 8px/1 system-ui;letter-spacing:.12em;pointer-events:none;backdrop-filter:blur(8px)';
+    badge.className='v17-locomotion-badge';
+    document.body.appendChild(badge);
+    const style=document.createElement('style');
+    style.textContent='body.hide-game-overlays .v17-locomotion-badge,body.hud-hidden .v17-locomotion-badge{display:none!important}';
+    document.head.appendChild(style);
+    return true;
+  }
+  if(!installV17()){
+    let tries=0;const timer=setInterval(()=>{tries++;if(installV17()||tries>260)clearInterval(timer);},100);
+  }
+})();
+</script>
+
+
+<script>
+(function(){
+  function installV18(){
+    const game=window.__brickBirdsGame;
+    if(!game||!game.__v16Patched||game.__v18Patched)return !!game;
+    game.__v18Patched=true;
+    console.info('Brick Birds v18 — relaxed follow camera');
+
+    const follow=game.v16Camera;
+    if(!follow||!game.controls||!game.camera)return false;
+    const previousUpdate=game.updateCamera.bind(game);
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const damp=(rate,dt)=>1-Math.exp(-rate*Math.max(.001,dt));
+    const now=()=>performance.now();
+
+    /* A calmer chase-camera profile: less look-ahead, slower yaw response,
+       no rapid speed zoom, and a longer pause after manual orbiting. */
+    follow.distance=10.35;
+    follow.height=5.55;
+    follow.manualGrace=2600;
+    follow.lastStableForward=follow.forward.clone();
+    follow.obstructionDistance=follow.distance;
+
+    if(game.controls&&game.controls.addEventListener){
+      game.controls.addEventListener('end',()=>{
+        follow.manual=false;
+        follow.manualUntil=now()+follow.manualGrace;
+      });
+    }
+
+    game.updateCamera=function(dt){
+      dt=clamp(dt||.016,.001,.055);
+
+      if(!this.isPlaying||!this.player){
+        previousUpdate(dt);
+        return;
+      }
+
+      this.worldShift+=(0-this.worldShift)*damp(1.65,dt);
+      this.world.position.x=this.worldShift;
+
+      const playerWorld=this.player.position.clone().add(this.world.position);
+      if(!follow.lastPlayer){
+        follow.lastPlayer=playerWorld.clone();
+        follow.velocity.set(0,0,0);
+      }
+
+      const frameMove=playerWorld.clone().sub(follow.lastPlayer);
+      /* Teleports/recovery should reset the camera instead of creating a huge
+         velocity sample that whips it around the player. */
+      if(frameMove.lengthSq()>9){
+        follow.lastPlayer.copy(playerWorld);
+        follow.velocity.set(0,0,0);
+      }else{
+        const measured=frameMove.multiplyScalar(1/Math.max(dt,.001));
+        measured.y=0;
+        follow.velocity.lerp(measured,damp(2.15,dt));
+      }
+
+      const speed=follow.velocity.length();
+      if(speed>.55){
+        const candidate=follow.velocity.clone().setY(0).normalize();
+        const dot=clamp(follow.forward.dot(candidate),-1,1);
+        const angle=Math.acos(dot);
+        /* Ignore tiny direction changes and only gradually rotate after the
+           bird has committed to a new travel direction. */
+        if(angle>.17){
+          const turnRate=speed>2.4?1.45:1.0;
+          follow.forward.lerp(candidate,damp(turnRate,dt)).normalize();
+        }
+      }
+
+      const lookDistance=clamp(.32+speed*.11,.32,.92);
+      const desiredTarget=playerWorld.clone()
+        .add(this.camera.up.clone().multiplyScalar(.8))
+        .addScaledVector(follow.forward,lookDistance);
+
+      const oldTarget=this.controls.target.clone();
+      this.controls.target.lerp(desiredTarget,damp(3.0,dt));
+      const targetShift=this.controls.target.clone().sub(oldTarget);
+      const manualHold=follow.manual||now()<follow.manualUntil;
+
+      if(manualHold&&!follow.forceRecenter){
+        /* While the player is manually orbiting, follow only the player's
+           translation and do not auto-rotate the orbit. */
+        this.camera.position.add(targetShift);
+      }else{
+        const distance=follow.distance+clamp(speed*.045,0,.28);
+        const height=follow.height+clamp(speed*.025,0,.18);
+        const right=follow.forward.clone().cross(this.camera.up).normalize().multiplyScalar(-1);
+        let desiredCamera=this.controls.target.clone()
+          .addScaledVector(follow.forward,-distance)
+          .addScaledVector(right,.18)
+          .add(this.camera.up.clone().multiplyScalar(height));
+
+        /* Collision shortening is smoothed so passing a tree or wall does not
+           make the camera pulse forward and backward. */
+        let allowedDistance=distance;
+        if(this.worldModel&&this.collisionRay){
+          this.world.updateMatrixWorld(true);
+          const rayOrigin=this.controls.target.clone().add(this.camera.up.clone().multiplyScalar(.28));
+          const rayVector=desiredCamera.clone().sub(rayOrigin);
+          const rayDistance=rayVector.length();
+          if(rayDistance>.01){
+            rayVector.normalize();
+            this.collisionRay.set(rayOrigin,rayVector);
+            this.collisionRay.near=.25;
+            this.collisionRay.far=rayDistance;
+            const hits=this.collisionRay.intersectObject(this.worldModel,false);
+            const hit=hits.find(item=>item.distance>.65&&item.distance<rayDistance);
+            if(hit)allowedDistance=Math.max(3.1,hit.distance-.72);
+          }
+        }
+        follow.obstructionDistance+=(allowedDistance-follow.obstructionDistance)*damp(3.2,dt);
+        if(follow.obstructionDistance<distance-.05){
+          const back=desiredCamera.clone().sub(this.controls.target).normalize();
+          desiredCamera=this.controls.target.clone().addScaledVector(back,follow.obstructionDistance);
+          desiredCamera.y=Math.max(desiredCamera.y,this.controls.target.y+2.35);
+        }
+
+        const error=this.camera.position.distanceTo(desiredCamera);
+        const rate=follow.forceRecenter?3.1:(error>14?2.5:1.65);
+        const response=Math.min(.16,damp(rate,dt));
+        this.camera.position.lerp(desiredCamera,response);
+        follow.forceRecenter=false;
+      }
+
+      if(this.cameraShake>.001&&this.motion>.5){
+        const shake=this.cameraShake*.55;
+        this.camera.position.x+=(Math.random()-.5)*shake;
+        this.camera.position.y+=(Math.random()-.5)*shake*.35;
+        this.cameraShake*=Math.pow(.045,dt);
+      }
+
+      this.controls.update();
+      follow.lastPlayer.copy(playerWorld);
+      follow.previousTarget.copy(this.controls.target);
+    };
+
+    if(game.toast)game.toast('Relaxed follow camera enabled');
+  }
+
+  if(!installV18()){
+    let attempts=0;
+    const timer=setInterval(()=>{attempts++;if(installV18()||attempts>260)clearInterval(timer);},100);
+  }
+})();
+</script>
+
+
+<script>
+(function(){
+  function installV19(){
+    const game=window.__brickBirdsGame;
+    if(!game||!game.__v18Patched||game.__v19Patched)return !!game;
+    game.__v19Patched=true;
+    console.info('Brick Birds v19 — wider elevated follow camera + improved occlusion handling');
+
+    const follow=game.v16Camera;
+    if(!follow||!game.controls||!game.camera)return false;
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const damp=(rate,dt)=>1-Math.exp(-rate*Math.max(.001,dt));
+    const now=()=>performance.now();
+
+    /* A wider, higher chase view so the player can see platforms and routes
+       without nearby trees or structures filling the screen. */
+    follow.distance=13.8;
+    follow.height=7.9;
+    follow.lookAhead=.65;
+    follow.manualGrace=3000;
+    follow.obstructionDistance=follow.distance;
+    follow.occlusionHeight=0;
+    follow.lastClearSide=1;
+
+    game.camera.fov=53;
+    game.camera.near=.12;
+    game.camera.updateProjectionMatrix();
+    game.controls.minDistance=9.5;
+    game.controls.maxDistance=72;
+    game.controls.minPolarAngle=.28;
+    game.controls.maxPolarAngle=1.3;
+
+    function hasBlockingHit(origin,candidate){
+      if(!game.worldModel||!game.collisionRay)return false;
+      const ray=candidate.clone().sub(origin);
+      const length=ray.length();
+      if(length<.01)return false;
+      ray.normalize();
+      game.collisionRay.set(origin,ray);
+      game.collisionRay.near=.9;
+      game.collisionRay.far=Math.max(.9,length-.65);
+      const hits=game.collisionRay.intersectObject(game.worldModel,false);
+      return hits.some(hit=>hit.distance>1.0&&hit.distance<length-.7);
+    }
+
+    game.updateCamera=function(dt){
+      dt=clamp(dt||.016,.001,.055);
+
+      if(!this.isPlaying||!this.player){
+        /* Keep the existing title-screen camera behavior. */
+        const legacy=game.__v19LegacyUpdate;
+        if(legacy)legacy(dt);
+        else{
+          this.controls.update();
+          if(this.composer&&this.composer.render)this.composer.render();
+        }
+        return;
+      }
+
+      this.worldShift+=(0-this.worldShift)*damp(1.5,dt);
+      this.world.position.x=this.worldShift;
+
+      const playerWorld=this.player.position.clone().add(this.world.position);
+      if(!follow.lastPlayer){
+        follow.lastPlayer=playerWorld.clone();
+        follow.velocity.set(0,0,0);
+      }
+
+      const frameMove=playerWorld.clone().sub(follow.lastPlayer);
+      if(frameMove.lengthSq()>9){
+        follow.lastPlayer.copy(playerWorld);
+        follow.velocity.set(0,0,0);
+      }else{
+        const measured=frameMove.multiplyScalar(1/Math.max(dt,.001));
+        measured.y=0;
+        follow.velocity.lerp(measured,damp(1.9,dt));
+      }
+
+      const speed=follow.velocity.length();
+      if(speed>.6){
+        const candidateForward=follow.velocity.clone().setY(0).normalize();
+        const dot=clamp(follow.forward.dot(candidateForward),-1,1);
+        const angle=Math.acos(dot);
+        if(angle>.2){
+          follow.forward.lerp(candidateForward,damp(speed>2.6?1.25:.85,dt)).normalize();
+        }
+      }
+
+      const lookDistance=clamp(.42+speed*.08,.42,.86);
+      const up=this.camera.up.clone();
+      const desiredTarget=playerWorld.clone()
+        .add(up.clone().multiplyScalar(1.0))
+        .addScaledVector(follow.forward,lookDistance);
+
+      const oldTarget=this.controls.target.clone();
+      this.controls.target.lerp(desiredTarget,damp(2.45,dt));
+      const targetShift=this.controls.target.clone().sub(oldTarget);
+      const manualHold=follow.manual||now()<follow.manualUntil;
+
+      if(manualHold&&!follow.forceRecenter){
+        this.camera.position.add(targetShift);
+      }else{
+        const right=new W(follow.forward.z,0,-follow.forward.x).normalize();
+        const baseDistance=follow.distance+clamp(speed*.04,0,.22);
+        const baseHeight=follow.height+clamp(speed*.018,0,.14);
+        const targetOrigin=this.controls.target.clone().add(up.clone().multiplyScalar(.45));
+
+        let desiredCamera=this.controls.target.clone()
+          .addScaledVector(follow.forward,-baseDistance)
+          .addScaledVector(right,.55)
+          .add(up.clone().multiplyScalar(baseHeight));
+
+        /* Prefer moving the camera upward or slightly sideways instead of
+           zooming tightly into the player when a structure blocks the view. */
+        if(this.worldModel&&this.collisionRay){
+          this.world.updateMatrixWorld(true);
+          if(hasBlockingHit(targetOrigin,desiredCamera)){
+            const candidates=[];
+            const raises=[2.2,4.1,6.2];
+            const sides=[follow.lastClearSide*2.0,-follow.lastClearSide*2.0,3.2,-3.2];
+            for(const rise of raises){
+              candidates.push(desiredCamera.clone().add(up.clone().multiplyScalar(rise)));
+              for(const side of sides){
+                candidates.push(desiredCamera.clone()
+                  .add(up.clone().multiplyScalar(rise))
+                  .addScaledVector(right,side));
+              }
+            }
+            let clear=null;
+            for(const candidate of candidates){
+              if(!hasBlockingHit(targetOrigin,candidate)){
+                clear=candidate;
+                const sideAmount=candidate.clone().sub(desiredCamera).dot(right);
+                if(Math.abs(sideAmount)>.5)follow.lastClearSide=Math.sign(sideAmount)||follow.lastClearSide;
+                break;
+              }
+            }
+            if(clear){
+              desiredCamera=clear;
+              follow.occlusionHeight+=(desiredCamera.y-(this.controls.target.y+baseHeight)-follow.occlusionHeight)*damp(4.0,dt);
+            }else{
+              /* Last resort: a high overview angle. Keep useful distance rather
+                 than collapsing the camera against the bird. */
+              desiredCamera=this.controls.target.clone()
+                .addScaledVector(follow.forward,-10.8)
+                .addScaledVector(right,1.1*follow.lastClearSide)
+                .add(up.clone().multiplyScalar(12.2));
+              follow.occlusionHeight+=(4.3-follow.occlusionHeight)*damp(3.0,dt);
+            }
+          }else{
+            follow.occlusionHeight+=(0-follow.occlusionHeight)*damp(1.35,dt);
+          }
+        }
+
+        /* Keep a generous minimum horizontal separation from the target. */
+        const horizontal=desiredCamera.clone().sub(this.controls.target);
+        horizontal.y=0;
+        const horizontalDistance=horizontal.length();
+        if(horizontalDistance<10.2){
+          if(horizontalDistance<.01)horizontal.copy(follow.forward).multiplyScalar(-1);
+          horizontal.normalize().multiplyScalar(10.2);
+          desiredCamera.x=this.controls.target.x+horizontal.x;
+          desiredCamera.z=this.controls.target.z+horizontal.z;
+        }
+        desiredCamera.y=Math.max(desiredCamera.y,this.controls.target.y+5.8);
+
+        const error=this.camera.position.distanceTo(desiredCamera);
+        const rate=follow.forceRecenter?2.8:(error>18?2.15:1.35);
+        this.camera.position.lerp(desiredCamera,Math.min(.14,damp(rate,dt)));
+        follow.forceRecenter=false;
+      }
+
+      if(this.cameraShake>.001&&this.motion>.5){
+        const shake=this.cameraShake*.38;
+        this.camera.position.x+=(Math.random()-.5)*shake;
+        this.camera.position.y+=(Math.random()-.5)*shake*.3;
+        this.cameraShake*=Math.pow(.045,dt);
+      }
+
+      this.controls.update();
+      follow.lastPlayer.copy(playerWorld);
+      follow.previousTarget.copy(this.controls.target);
+    };
+
+    /* Preserve the v18 title camera before replacing gameplay following. */
+    if(!game.__v19LegacyUpdate)game.__v19LegacyUpdate=game.updateCamera.bind(game);
+
+    /* The assignment above stored itself; replace the title fallback with a
+       lightweight stationary update to avoid recursion outside gameplay. */
+    game.__v19LegacyUpdate=function(){
+      game.controls.update();
+    };
+
+    if(game.toast)game.toast('Wide elevated camera enabled');
+  }
+
+  if(!installV19()){
+    let attempts=0;
+    const timer=setInterval(()=>{attempts++;if(installV19()||attempts>260)clearInterval(timer);},100);
+  }
+})();
+</script>
+
 </body>
 </html>
